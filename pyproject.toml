@@ -1,0 +1,13 @@
+[project]
+name = "saasnews-job-finder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "google-auth>=2.55.2",
+    "gspread>=6.2.1",
+    "openpyxl>=3.1.5",
+    "requests>=2.34.2",
+]
