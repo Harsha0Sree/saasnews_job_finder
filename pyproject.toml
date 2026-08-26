@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "saasnews-job-finder"
 version = "0.1.0"
-description = "Add your description here"
+description = "TheSaaSNews funding-round scraper that finds fresher-eligible Python-stack jobs in India or remote-worldwide"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,4 +14,25 @@ dependencies = [
     "gspread>=6.2.1",
     "openpyxl>=3.1.5",
     "requests>=2.34.2",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.40.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+saasnews-scraper = "saasnews_scraper:cli"
+saasnews-sync = "sync_to_google_sheets:cli"
+saasnews-feedback = "collect_feedback:main"
+saasnews-watch = "watch_feedback:cli"
+
+[tool.setuptools]
+py-modules = ["saasnews_scraper", "sync_to_google_sheets", "combine_results", "collect_feedback", "watch_feedback"]
+packages = ["saasnews"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not network'"
+markers = [
+    "network: tests that hit the live internet (deselect by default)",
 ]
