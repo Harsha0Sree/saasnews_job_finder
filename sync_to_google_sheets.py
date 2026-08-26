@@ -34,6 +34,7 @@ import argparse
 import glob
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -61,12 +62,15 @@ SCOPES = [
 
 
 def find_credentials() -> str:
-    """Find the Google service account credentials JSON file."""
+    """Find the Google service account credentials JSON file.
+
+    Precedence: GOOGLE_APPLICATION_CREDENTIALS env var → ./google-credentials.json
+    → ~/google-credentials.json.
+    """
     candidates = [
+        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""),
         "google-credentials.json",
         os.path.expanduser("~/google-credentials.json"),
-        "/home/mikeysama/saasnews-job-finder/google-credentials.json",
-        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""),
     ]
     for c in candidates:
         if c and os.path.exists(c):
@@ -100,104 +104,207 @@ def read_matches_from_xlsx(xlsx_path: str) -> list[list]:
     return rows
 
 
-def full_sync(spreadsheet, rows: list[list]) -> None:
-    """Full sync: clear the sheet and rewrite all rows."""
+# Columns the user owns in the sheet; a re-sync must never overwrite them.
+USER_COLUMNS = ("applied", "feedback", "notes")
+
+
+def _parse_seen(value) -> datetime:
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def merge_sheet_rows(headers: list[str], existing: list[list],
+                     incoming: list[list], keep_sheet_only: bool = True) -> list[list]:
+    """Merge incoming scrape rows into the sheet's current rows.
+
+    - Deduplicated by Job URL.
+    - Sorted newest-first by First Seen (latest scraped jobs at the top);
+      timestamp-less rows sink to the bottom in stable order.
+    - USER_COLUMNS survive from the existing sheet row when the URL matches
+      (the xlsx regenerates them blank); system columns refresh from incoming.
+    - keep_sheet_only=True (incremental): rows that exist only in the sheet
+      are retained below the merged set. False (full sync): dropped.
+
+    Returns rows padded/trimmed to len(headers), headers row excluded.
+    """
+    hmap = {h.strip().lower(): i for i, h in enumerate(headers) if h}
+    url_idx = hmap.get("job url")
+    seen_idx = hmap.get("first seen")
+    user_idx = [hmap[c] for c in USER_COLUMNS if c in hmap]
+    width = len(headers)
+    if url_idx is None:
+        # Cannot dedupe without a key column — fall back to incoming only.
+        return [[str(v) for v in r] for r in incoming]
+
+    def normalize(row):
+        vals = [str(v) if v is not None else "" for v in row]
+        return vals[:width] + [""] * (width - len(vals))
+
+    merged: dict[str, list] = {}
+    order: list[str] = []
+
+    for row in existing:
+        row = normalize(row)
+        url = row[url_idx]
+        if not url:
+            continue
+        if url not in merged:
+            order.append(url)
+        merged[url] = row
+
+    for row in incoming:
+        row = normalize(row)
+        url = row[url_idx]
+        if not url:
+            continue
+        prior = merged.get(url)
+        if prior is not None:
+            # Refresh system columns; preserve the user's tracking edits.
+            for i in range(width):
+                if i not in user_idx:
+                    row[i] = row[i] or prior[i]
+                else:
+                    row[i] = prior[i] or row[i]
+        else:
+            order.append(url)
+        merged[url] = row
+
+    if keep_sheet_only:
+        keys = [(order.index(u), u) for u in order]
+    else:
+        incoming_urls = {normalize(r)[url_idx] for r in incoming}
+        keys = [(i, u) for i, u in enumerate(order) if u in incoming_urls]
+
+    rows = [merged[u] for _, u in sorted(keys)]
+    if seen_idx is None:
+        return rows
+    rows.sort(key=lambda r: _parse_seen(r[seen_idx]), reverse=True)
+
+    # Applied jobs sink below the active feed: the top of the sheet must be
+    # the fresh list. Relative order within each section is preserved.
+    applied_idx = hmap.get("applied")
+    if applied_idx is not None:
+        active = [r for r in rows if r[applied_idx].strip().lower() != "yes"]
+        done = [r for r in rows if r[applied_idx].strip().lower() == "yes"]
+        if done:
+            rows = active + done
+    return rows
+
+
+def _create_matches_sheet(spreadsheet, headers):
     try:
         worksheet = spreadsheet.worksheet("Matches")
-        worksheet.clear()
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet("Matches",
-                                               rows=max(len(rows), 100),
-                                               cols=len(rows[0]) if rows else 20)
+        worksheet = spreadsheet.add_worksheet("Matches", rows=100,
+                                              cols=len(headers))
+        worksheet.update("A1", [headers], value_input_option="RAW")
+        print("Created 'Matches' worksheet with headers.")
+    return worksheet
 
-    # Also clear default Sheet1.
+
+def _existing_rows(worksheet) -> list[list]:
     try:
-        sheet1 = spreadsheet.worksheet("Sheet1")
-        sheet1.clear()
-    except gspread.WorksheetNotFound:
-        pass
+        all_values = worksheet.get_all_values()
+        return all_values[1:] if all_values else []
+    except Exception as e:
+        print(f"WARNING: could not read existing sheet rows: {e}")
+        return []
 
-    if not rows:
-        print("No rows to write.")
+
+def _write_merged(worksheet, headers: list[str], merged: list[list],
+                  mode: str) -> None:
+    if not merged:
+        print("No matches to sync.")
         return
-
-    print(f"Writing {len(rows)} rows (full sync)...")
-    end_cell = gspread.utils.rowcol_to_a1(len(rows), len(rows[0]))
+    worksheet.resize(rows=len(merged) + 10, cols=len(headers))
+    end_cell = gspread.utils.rowcol_to_a1(len(merged) + 1, len(headers))
     worksheet.update(
         f"A1:{end_cell}",
-        rows,
+        [headers] + merged,
         value_input_option="RAW",
     )
     _format_header(worksheet)
-    print(f"✓ Full sync complete: {len(rows) - 1} matches.")
+    _apply_dropdowns(worksheet, headers)
+    print(f"✓ {mode} sync complete: {len(merged)} matches "
+          f"(newest at top, Applied/Feedback/Notes preserved).")
+
+
+def _apply_dropdowns(worksheet, headers: list[str]) -> None:
+    """Best-effort dropdown validation for the tracking columns."""
+    try:
+        hmap = {h.strip().lower(): i for i, h in enumerate(headers) if h}
+        validations = []
+        if "applied" in hmap:
+            validations.append((hmap["applied"], ["Yes", "No"]))
+        if "feedback" in hmap:
+            from saasnews.feedback import CONSTRAINTS
+            validations.append((hmap["feedback"], list(CONSTRAINTS)))
+        for col_idx, values in validations:
+            col = gspread.utils.get_column_letter(col_idx + 1)
+            dv = gspread.DataValidation(
+                requirement_type="ONE_OF_LIST",
+                strict=False,
+                values=[v for v in values],
+                show_custom_ui=True,
+            )
+            dv.add(f"{col}2:{col}10000")
+            worksheet.add_data_validation(dv)
+    except Exception as e:
+        print(f"(Dropdown validation skipped: {e})")
+
+
+def full_sync(spreadsheet, rows: list[list]) -> None:
+    """Full sync: the sheet mirrors the xlsx exactly. User-owned columns are
+    preserved by Job URL; rows no longer present in the xlsx are dropped."""
+    headers, incoming = rows[0], rows[1:]
+    worksheet = _create_matches_sheet(spreadsheet, headers)
+    existing = _existing_rows(worksheet)
+    merged = merge_sheet_rows(headers, existing, incoming, keep_sheet_only=False)
+
+    # Also clear default Sheet1.
+    try:
+        spreadsheet.worksheet("Sheet1").clear()
+    except gspread.WorksheetNotFound:
+        pass
+
+    if not merged:
+        print("No rows to write.")
+        return
+    print(f"Merging {len(incoming)} xlsx rows against {len(existing)} sheet rows...")
+    _write_merged(worksheet, headers, merged, mode="Full")
 
 
 def incremental_sync(spreadsheet, rows: list[list]) -> None:
-    """Incremental sync: append only new matches (deduped by Job URL)."""
+    """Incremental sync: append new matches only (deduped by Job URL),
+    newest at top, preserving user tracking edits and sheet history."""
     if len(rows) <= 1:
         print("No matches to sync.")
         return
+    headers, incoming = rows[0], rows[1:]
+    worksheet = _create_matches_sheet(spreadsheet, headers)
+    existing = _existing_rows(worksheet)
 
-    try:
-        worksheet = spreadsheet.worksheet("Matches")
-    except gspread.WorksheetNotFound:
-        # Create the worksheet with headers.
-        worksheet = spreadsheet.add_worksheet("Matches", rows=100, cols=len(rows[0]))
-        worksheet.update("A1", [rows[0]], value_input_option="RAW")
-        _format_header(worksheet)
-        worksheet.freeze(rows=1)
-        print("Created 'Matches' worksheet with headers.")
+    hmap = {h.strip().lower(): i for i, h in enumerate(headers) if h}
+    url_idx = hmap.get("job url")
+    width = len(headers)
 
-    # Read existing Job URLs (column K = index 10 in our schema, but let's find it).
-    headers = worksheet.row_values(1)
-    job_url_col = None
-    for i, h in enumerate(headers, 1):
-        if h.strip().lower() == "job url":
-            job_url_col = i
-            break
-    if job_url_col is None:
-        print("WARNING: 'Job URL' column not found. Falling back to full sync.")
-        full_sync(spreadsheet, rows)
+    def norm(row):
+        vals = [str(v) if v is not None else "" for v in row]
+        return vals[:width] + [""] * (width - len(vals))
+
+    if url_idx is None:
+        print("WARNING: 'Job URL' column not found; cannot dedupe.")
         return
+    existing_urls = {norm(r)[url_idx] for r in existing if r}
+    new_count = sum(1 for r in incoming
+                    if norm(r)[url_idx] and norm(r)[url_idx] not in existing_urls)
+    print(f"Merging {len(incoming)} xlsx rows against {len(existing)} sheet rows "
+          f"({new_count} new)...")
 
-    # Read all existing job URLs.
-    col_letter = gspread.utils.get_column_letter(job_url_col)
-    existing_urls = set()
-    try:
-        existing_values = worksheet.col_values(job_url_col)[1:]  # skip header
-        existing_urls = {v for v in existing_values if v}
-    except Exception as e:
-        print(f"WARNING: Could not read existing URLs: {e}")
-
-    # Find new rows.
-    header_row = rows[0]
-    job_url_idx = None
-    for i, h in enumerate(header_row):
-        if h.strip().lower() == "job url":
-            job_url_idx = i
-            break
-    if job_url_idx is None:
-        print("WARNING: 'Job URL' not in xlsx headers. Falling back to full sync.")
-        full_sync(spreadsheet, rows)
-        return
-
-    new_rows = []
-    for row in rows[1:]:
-        job_url = row[job_url_idx] if job_url_idx < len(row) else ""
-        if job_url and job_url not in existing_urls:
-            new_rows.append(row)
-            existing_urls.add(job_url)
-
-    if not new_rows:
-        print(f"No new matches to append ({len(existing_urls)} already in sheet).")
-        return
-
-    # Append new rows.
-    print(f"Appending {len(new_rows)} new matches (incremental sync)...")
-    # gspread append_rows adds to the first empty row after the data.
-    worksheet.append_rows(new_rows, value_input_option="RAW",
-                          insert_data_option="INSERT_ROWS", table_range="A1")
-    print(f"✓ Incremental sync complete: appended {len(new_rows)} new matches.")
+    merged = merge_sheet_rows(headers, existing, incoming, keep_sheet_only=True)
+    _write_merged(worksheet, headers, merged, mode="Incremental")
 
 
 def _format_header(worksheet) -> None:
@@ -211,20 +318,27 @@ def _format_header(worksheet) -> None:
     worksheet.freeze(rows=1)
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Sync scraper results to Google Sheets")
     parser.add_argument("--sheet-id", default=os.environ.get("GOOGLE_SHEET_ID", DEFAULT_SHEET_ID),
-                        help=f"Google Sheet ID (default: {DEFAULT_SHEET_ID})")
+                        help=f"Google Sheet ID (default: {DEFAULT_SHEET_ID}, "
+                             "overridable via GOOGLE_SHEET_ID env var)")
     parser.add_argument("--xlsx", default="",
                         help="Path to xlsx file (default: latest in download/)")
-    parser.add_argument("--download-dir", default="/home/mikeysama/products/saasnews-job-finder/download",
-                        help="Directory containing xlsx files")
-    parser.add_argument("--creds", default="/home/mikeysama/saasnews-job-finder/google-credentials.json",
-                        help="Path to Google service account JSON (default: auto-detect)")
+    parser.add_argument("--download-dir", default="./download",
+                        help="Directory containing xlsx files (default: ./download)")
+    parser.add_argument("--creds", default="",
+                        help="Path to Google service account JSON (default: auto-detect "
+                             "via GOOGLE_APPLICATION_CREDENTIALS, then ./google-credentials.json, "
+                             "then ~/google-credentials.json)")
     parser.add_argument("--incremental", action="store_true",
                         help="Incremental sync: append only new matches (deduped by Job URL). "
                              "Default is full sync (clear + rewrite).")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
 
     # Find the xlsx file.
     if args.xlsx:
@@ -276,5 +390,10 @@ def main():
     print(f"\n✓ Done. View at: https://docs.google.com/spreadsheets/d/{args.sheet_id}/edit")
 
 
+def cli() -> None:
+    """Console-script entry point (zero-arg callable)."""
+    raise SystemExit(main())
+
+
 if __name__ == "__main__":
-    main()
+    cli()

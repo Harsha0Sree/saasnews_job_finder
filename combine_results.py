@@ -4,6 +4,7 @@ Combine multiple saasnews_scraper.py output xlsx files into one master file.
 De-duplicates by job URL, applies the latest location filter, and produces a
 clean master workbook with the best available data per match.
 """
+import argparse
 import glob
 import re
 import sys
@@ -14,35 +15,14 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
-# ---- Filter patterns (mirrors saasnews_scraper.py) ----
-RESTRICTED_REMOTE_REJECT = [
-    r"remote\s*\(us\b", r"remote\s*\(united\s+states", r"remote\s*\(usa?\)",
-    r"remote\s*\(uk\b", r"remote\s*\(united\s+kingdom",
-    r"remote\s*\(eu\)", r"remote\s*\(europe\)", r"remote\s*\(emea\)",
-    r"remote\s*\(germany\)", r"remote\s*\(france\)",
-    r"remote\s*\(canada\)", r"remote\s*\(aus\w*\)",
-    r"remote\s*\(latam\)", r"remote\s*\(apac\)",
-    r"us\s+only", r"uk\s+only", r"eu\s+only",
-    r"north\s+america\s+only", r"europe\s+only",
-    r"^\s*u\.?s\.?a?\.?\s*(?:,|/|\|)?\s*(?:remote|hybrid)?\s*$",
-    r"^\s*u\.?k\.?\s*(?:,|/|\|)?\s*(?:remote|hybrid)?\s*$",
-    r"^\s*eu\.?\s*(?:,|/|\|)?\s*(?:remote|hybrid)?\s*$",
-    r"\bus\s*,\s*remote\b",
-    r"\buk\s*,\s*remote\b",
-    r"\beu\s*,\s*remote\b",
-    r"\bunited\s+states\s*,\s*remote\b",
-    r"\bunited\s+kingdom\s*,\s*remote\b",
-    r"\bremote\s*,\s*u\.?s\.?a?\.?\b",
-    r"\bremote\s*,\s*united\s+states\b",
-    r"\bremote\s*,\s*u\.?k\.?\b",
-    r"\bremote\s*,\s*united\s+kingdom\b",
-    r"\bremote\s*,\s*eu\.?\b",
-    r"\bremote\s*,\s*europe\b",
-    r"\bremote\s*,\s*canada\b",
-    r"\bsan\s+francisco\s*/\s*remote\b",
-    r"\bnew\s+york\s*/\s*remote\b",
-]
-RESTRICTED_RE = re.compile("|".join(RESTRICTED_REMOTE_REJECT), re.IGNORECASE)
+# Shared location policy — the same tables the scraper pipeline uses.
+# (Re-filtering stored rows applies them without job titles, plus a few
+# combiner-specific guards below.)
+from saasnews.filters import (
+    BARE_REMOTE,
+    INDIA_RE,
+    RESTRICTED_REMOTE_RE,
+)
 
 # US city names — if a location mentions these AND "remote" without an India
 # token, it's effectively US-restricted remote (not worldwide).
@@ -64,16 +44,6 @@ EU_CITY_RE = re.compile(
 # Reject locations that look like Python dict reprs (from broken JSON-LD
 # parsing in earlier runs).
 DICT_REPR_RE = re.compile(r"^\s*\{.*\}\s*$", re.DOTALL)
-
-INDIA_TOKENS = [
-    "india", "bangalore", "bengaluru", "mumbai", "delhi", "new delhi",
-    "noida", "gurugram", "gurgaon", "pune", "hyderabad", "chennai",
-    "kolkata", "ahmedabad", "jaipur", "kochi", "coimbatore", "indore",
-    "chandigarh", "lucknow", "bhubaneswar", "trivandrum", "thiruvananthapuram",
-    "visakhapatnam", "remote.*india", "india.*remote",
-]
-INDIA_RE = re.compile("|".join(INDIA_TOKENS), re.IGNORECASE)
-BARE_REMOTE = re.compile(r"\bremote\b", re.IGNORECASE)
 
 # ---- Styling ----
 HEADER_FILL = PatternFill("solid", fgColor="1F2937")
@@ -97,7 +67,7 @@ def location_passes(loc: str) -> bool:
     # Reject dict reprs from broken JSON-LD parsing.
     if DICT_REPR_RE.search(loc):
         return False
-    if RESTRICTED_RE.search(loc):
+    if RESTRICTED_REMOTE_RE.search(loc):
         return False
     if INDIA_RE.search(loc):
         return True
@@ -153,8 +123,18 @@ def clean_location(loc: str) -> str:
     return loc.strip(" ·,|•\u2022-—")[:60]
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Combine saasnews_jobs_*.xlsx run outputs into one master workbook"
+    )
+    parser.add_argument("--download-dir", default="./download",
+                        help="Directory containing the run xlsx files (default: ./download)")
+    return parser.parse_args(argv)
+
+
 def main():
-    out_dir = Path("/home/mikeysama/products/saasnews-job-finder/download")
+    args = parse_args()
+    out_dir = Path(args.download_dir)
     files = sorted(glob.glob(str(out_dir / "saasnews_jobs_*.xlsx")))
     if not files:
         print("No input files found.")
@@ -250,6 +230,7 @@ def main():
         "Apply URL", "Job URL",
         "Company Website", "Careers Page", "Funding Round", "Funding Date",
         "Software Category", "News Headline", "News URL",
+        "First Seen", "Applied", "Feedback", "Notes",
     ]
     for c, h in enumerate(headers1, 1):
         cell = ws1.cell(row=1, column=c, value=h)
@@ -271,11 +252,22 @@ def main():
             rec.get("Funding Round", ""), rec.get("Funding Date", ""),
             rec.get("Software Category", ""), rec.get("News Headline", ""),
             rec.get("News URL", ""),
+            # Tracking passthrough: keep user marks and feed timestamps.
+            rec.get("First Seen", ""), rec.get("Applied", ""),
+            rec.get("Feedback", ""), rec.get("Notes", ""),
         ])
     conf_order = {"high": 0, "medium": 1, "low": 2}
-    rows.sort(key=lambda r: (conf_order.get(str(r[3]).lower(), 9),
-                              0 if r[2] == "AI/ML" else 1 if r[2] == "Backend" else 2,
-                              r[0].lower()))
+    fs_idx = headers1.index("First Seen")
+
+    def _parse_seen(value):
+        try:
+            return datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    # Newest-scraped first, confidence as stable tiebreaker.
+    rows.sort(key=lambda r: (conf_order.get(str(r[3]).lower(), 9), r[0].lower()))
+    rows.sort(key=lambda r: _parse_seen(r[fs_idx]), reverse=True)
     color_map = {"high": HIGH_FILL, "medium": MED_FILL, "low": LOW_FILL}
     for r_idx, row in enumerate(rows, 2):
         for c_idx, val in enumerate(row, 1):
@@ -286,7 +278,7 @@ def main():
                 fill = color_map.get(str(val).lower())
                 if fill:
                     cell.fill = fill
-    widths = [22, 42, 12, 12, 20, 28, 18, 22, 14, 50, 50, 28, 38, 14, 14, 22, 50, 50]
+    widths = [22, 42, 12, 12, 20, 28, 18, 22, 14, 50, 50, 28, 38, 14, 14, 22, 50, 50, 22, 10, 20, 32]
     for i, w in enumerate(widths, 1):
         ws1.column_dimensions[get_column_letter(i)].width = w
     ws1.freeze_panes = "A2"

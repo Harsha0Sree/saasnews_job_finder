@@ -1,185 +1,186 @@
-# TheSaaSNews → Fresher Python-Stack Job Finder (Production-Ready)
+# TheSaaSNews → Fresher Python-Stack Job Finder
 
-Automatically scrapes every funding-round announcement on
+Automatically scrapes funding-round announcements on
 [thesaasnews.com/news/](https://www.thesaasnews.com/news/), follows each
 company's careers page, parses open roles, and filters for **fresher-eligible
 Python-stack backend / AI-ML / full-stack / data engineering jobs** (internships
 OK) located in **India** or **remote-worldwide**.
 
-## What makes this production-ready
-
-### 1. Bulletproof experience filter
-- **Multi-signal approach**: title keywords + JD-text years extraction + seniority detection
-- **10 regex patterns** for years extraction: "5+ years", "3-5 years", "minimum 5 years", "at least 4 years", "experience: 5 years", "5 years building", "should have 5 years", etc.
-- **Senior title detection**: Senior, Sr., Sr, Staff, Principal, Lead, Manager, Director, VP, CTO, Architect, Founding, II, III, IV (Roman numerals)
-- **Fresher title detection**: Junior, Fresher, Intern, Fellow, Apprentice, SDE-1, L1, L2, entry-level, graduate
-
-### 2. Playwright headless browser fallback
-- Many SaaS careers pages are JavaScript SPAs (React/Next.js/Vue) — `requests.get` can't render them
-- When `requests.get` returns short content (<200 chars, likely JS-rendered), the scraper automatically falls back to **Playwright Chromium** to render the page
-- This works for both careers page job parsing AND individual JD text extraction
-- Thread-safe (uses a lock to serialize Playwright access)
-
-### 3. All 4 article formats supported
-The site has changed formats over time. All are handled:
-- **Format 1 (newest)**: `<br>` separators, `<a href>` links
-- **Format 2 (mid)**: `&nbsp;</p><p>` separators
-- **Format 3 (older)**: `<strong>` labels, plain-text URLs
-- **Format 4 (oldest)**: No Funding Details block
-
-### 4. Never hangs, never loses progress
-- Hard 90s per-company wall-clock budget
-- Separate connect (6s) / read (12s) timeouts
-- JSONL checkpoint after every company (atomic append + fsync)
-- XLSX rewritten every 10 companies
-- Resume support — re-running skips processed companies
-
-## Quick start
+## Setup (uv)
 
 ```bash
-# 1. Install dependencies (including Playwright)
-pip install -r requirements.txt
-playwright install chromium
+uv sync --extra browser          # runtime deps + Playwright
+uv run playwright install chromium
+uv sync --extra dev              # + pytest
 
-# 2. Run tests (verify everything works — 188 tests)
-python tests/run_tests.py
+# Run tests (deterministic, offline):
+.venv/bin/python -m pytest
 
-# 3. Run the scraper (scans ALL pages by default)
-python saasnews_scraper.py --fresher-only
+# Run the scraper:
+uv run saasnews-scraper --fresher-only        # console script…
+python saasnews_scraper.py --fresher-only     # …or directly
 
-# 4. Sync to Google Sheets (needs google-credentials.json)
-python sync_to_google_sheets.py --incremental
+# Watch sheets for feedback and self-tune continuously (or --once):
+uv run saasnews-watch
+python watch_feedback.py
 
-unzip saasnews-job-finder.zip && cd saasnews-job-finder
-pip install -r requirements.txt
-playwright install chromium
-python tests/run_tests.py                    # 198 tests pass
-
-# Daily scan (processes newest articles first, then resumes):
-python saasnews_scraper.py --fresher-only --priority-recent 200 --batch-size 500
-
-# Full scan (all pages, no priority):
-python saasnews_scraper.py --fresher-only
-
-# Cron job:
+# Daily scan via the venv-aware cron entrypoint (DRY_RUN=1 to preview):
 bash run_daily.sh
 ```
 
-## CLI options
+## Architecture
+
+| Module | Responsibility |
+|--------|----------------|
+| `saasnews_scraper.py` | Pipeline orchestration: discovery → article parse → careers find → jobs parse → filter → xlsx |
+| `saasnews/filters.py` | **Single source of truth** for job-evaluation policy: `match_role`, `match_location`, `is_fresher_role`, `extract_min_years` + regex tables. Pure functions, no I/O |
+| `saasnews/feedback.py` | Closed-loop feedback: constraint taxonomy (multi-select), JSONL log, learned-policy compiler (`build_policy`) |
+| `saasnews/diagnose.py` | Root-cause engine: replays the real filters against a re-fetched posting, isolates the missed signal, proposes evidence-backed learnings |
+| `collect_feedback.py` | Harvests Applied/Feedback marks from xlsx + Google Sheet into `download/feedback.jsonl` |
+| `watch_feedback.py` | Continuous watcher (`saasnews-watch`): polls sheets, harvests new feedback immediately, diagnoses each violation, writes learned.jsonl |
+| `sync_to_google_sheets.py` | Google Sheets sync (incremental merge: newest at top, preserves your tracking columns) |
+| `combine_results.py` | Merges run outputs into one master workbook using the shared filter tables |
+| `tests/` | Offline deterministic pytest suite (`pytest -m network` opts into live-web checks) |
+
+## Closed-loop feedback
+
+Every row in the Matches feed carries three user-owned columns:
+
+| Column | Values | Meaning |
+|--------|--------|---------|
+| `Applied` | Yes / No | application tracker (blank = not reviewed) |
+| `Feedback` | constraint dropdown (**multi-select**: combine several with commas) | what constraint(s) this job actually violated |
+| `Notes` | free text | context for future you |
+
+Marking `Applied = Yes` does two things: the job **leaves the active feed**
+(it moves to a dedicated `Applied` sheet in the xlsx, and sinks below the
+fresh list in Google Sheets), and it is never re-emitted by later runs.
+
+Constraints map 1:1 to the pipeline's real filters:
+`not_fresher`, `not_python_stack`, `wrong_role`, `bad_location`,
+`stale_or_closed`, `broken_link`, `duplicate_company`,
+`irrelevant_company`, `other`. A cell can hold several — e.g.
+`not_fresher, bad_location` — each becomes its own record (friendly
+aliases like "Senior" or "Wrong stack" also work).
+
+### The intelligent loop: watch → diagnose → self-tune
+
+Run a watcher alongside your day and feedback takes effect immediately,
+not on the next daily scrape:
+
+```bash
+python watch_feedback.py            # polls sheets every 120s (Ctrl-C to stop)
+python watch_feedback.py --interval 60
+```
+
+Every cycle it:
+1. **Harvests** new Applied/Feedback marks from the live Google Sheet + local xlsx.
+2. **Goes back to each flagged job posting** — re-fetches its JD text and
+   replays the exact same filters the pipeline runs — then isolates what was
+   overlooked: JD unavailable at scrape time? a duration demand invisible to
+   the years extractor ("24 months of experience")? a seniority marker
+   missing from the tables ("SDE 2")? region evidence hiding in the JD body
+   ("must be based in Texas")? the short-JD leniency branch accepting a
+   non-Python role?
+3. **Tweaks itself**, writing conservative, evidence-backed generalizations to
+   `download/learned.jsonl` (title/JD patterns, region tokens, per-domain
+   Python strictness) plus a full audit trail in `download/diagnosis.jsonl`.
+
+The daily run closes the same loop in one pass (`watch_feedback.py --once`
+replaces the old collect-only step), and every scrape compiles BOTH logs into
+its learned policy:
+
+```bash
+bash run_daily.sh
+# [1/4] watch_feedback.py --once → harvest your marks, diagnose misses, learn
+# [2/4] saasnews_scraper.py     → compiles feedback.jsonl + learned.jsonl BEFORE scraping:
+#         • blocked job URLs are never re-emitted
+#         • flagged locations rejected exactly AND via learned region tokens
+#         • companies with ≥3 flagged JOBS are skipped (multi-constraint rows
+#           count once — detailed feedback is not double punishment)
+#         • learned title/JD patterns tighten the fresher + role filters
+#         • python_strict domains lose the short-JD leniency for the stack check
+# [3/4] sync_to_google_sheets.py → newest-at-top merge, tracking columns preserved
+```
+
+Run Summary reports honest loop metrics every run: *Feedback Records Applied*,
+*Learned Patterns Active* (+ per-kind breakdown), *Companies Skipped (learned
+policy)*, *Known-Bad Jobs Suppressed*, plus a **Feedback Analysis** breakdown
+(constraint × the pipeline signal that let the job through — e.g.
+`not_fresher × no_jd_ambiguous_title: 3` tells you exactly where the fresher
+filter leaks).
+
+Learning stays auditable: every learned pattern names the job that taught it
+and quotes the evidence snippet. Un-teach by deleting its line from
+`download/learned.jsonl`; un-flag by deleting lines from
+`download/feedback.jsonl`.
+
+## Filtering pipeline
+
+1. **Role match** — category patterns (Internship first), title exclusions
+   (non-Python languages, sales/design roles).
+2. **Location match** — India tokens or remote-worldwide; restricted-region
+   tokens are checked in *both* location and title.
+3. **Fresher filter** (`--fresher-only`) — multi-signal: explicit junior/intern
+   titles pass, senior/staff/Sr./II titles reject, otherwise JD text is fetched
+   (Playwright fallback for JS pages) and years-of-experience extracted;
+   unverifiable cases accept as implicit (balanced).
+4. **Python-stack verification** — title mention, else JD must mention
+   Python/Django/FastAPI/PyTorch/etc.; short JD text stays lenient.
+
+## Configuration
+
+All paths default relative to the working directory; no machine-specific
+absolute paths are baked in.
+
+```bash
+GOOGLE_SHEET_ID                  # override target sheet for sync/run_daily.sh
+GOOGLE_APPLICATION_CREDENTIALS   # service-account JSON (or ./google-credentials.json)
+DRY_RUN=1 bash run_daily.sh      # print commands instead of executing
+```
+
+Scraper CLI options:
 
 ```
-python saasnews_scraper.py [options]
-
-  --news-pages N       Max pages to scan (default: 10000 = all)
-  --start-page N       Start from page N (for chunked runs)
-  --concurrency N      Parallel workers (default: 10; use 4-5 with Playwright)
-  --fresher-only       Only fresher-eligible roles (0-2 years exp + internships)
-  --no-python-stack    Disable Python-stack verification
-  --batch-size N       Process at most N articles this run (0 = no limit)
-  --since-days N       Only news from last N days
-  --limit N            Process at most N companies (0 = no limit)
-  --output-dir DIR     Where to save xlsx (default: ./download)
-  --reset-checkpoint   Delete checkpoint and start fresh
-  --verbose, -v        Debug logging
+--news-pages N       Max pages to scan (default: 0 = ALL, follow rel="next")
+--start-page N       Start from page N (chunked runs)
+--priority-recent N  Process N newest articles FIRST before resuming checkpoint
+--batch-size N       Process at most N articles this run (0 = no limit)
+--concurrency N      Parallel workers (default 5; use 4-5 with Playwright)
+--limit N            Max companies this run
+--since-days N       Only news from last N days
+--fresher-only       Only fresher-eligible roles (0-2 years + internships)
+--no-python-stack    Disable Python-stack verification
+--reset-checkpoint   Delete checkpoint and start fresh
+--output-dir DIR     Where to save xlsx (default: ./download)
+--verbose, -v        Debug logging
 ```
-
-## How the experience filter works
-
-| Title | JD available? | JD years? | Result |
-|-------|---------------|-----------|--------|
-| Junior Python Developer | — | — | ✅ fresher (title explicit) |
-| Software Engineer Intern | — | — | ✅ fresher (title explicit) |
-| Senior Software Engineer | — | — | ❌ rejected (title says Senior) |
-| Sr. Forward Deployed Engineer | — | — | ❌ rejected (Sr. detected) |
-| Software Engineer II | — | — | ❌ rejected (II = senior) |
-| Staff Engineer | — | — | ❌ rejected (Staff) |
-| Backend Engineer | Yes (300+ chars) | 0-2 years | ✅ fresher (JD verified) |
-| Backend Engineer | Yes (300+ chars) | 3+ years | ❌ rejected (JD says 3+) |
-| Backend Engineer | Yes (300+ chars) | no years mentioned | ✅ fresher (implicit) |
-| Backend Engineer | No JD (JS-rendered, Playwright fallback) | — | ✅ fresher (implicit) |
 
 ## Resume after crash/kill
 
-```bash
-# If killed, just re-run the same command:
-python saasnews_scraper.py --fresher-only
+The JSONL checkpoint (`download/checkpoint.jsonl`) is appended atomically after
+every company and fsynced. Re-running the same command skips processed
+companies and continues. The xlsx is rebuilt from the checkpoint every 10
+companies and at the end (atomic temp-file rename).
 
-# It loads checkpoint FIRST, skips processed companies, continues from where it left off.
-```
+Per-company wall-clock budget is enforced across every stage (homepage,
+careers probing, JD fetches) — a dead-slow site can never hold a worker much
+past its budget.
 
 ## Google Sheets sync
 
-### One-time setup
-1. Create a Google Service Account at https://console.cloud.google.com/iam-admin/serviceaccounts
-2. Download the JSON key, save as `google-credentials.json`
-3. Share your Google Sheet with the service account email as Editor
-4. Run: `python sync_to_google_sheets.py --incremental`
+One-time setup:
+1. Create a Google Service Account, download the JSON key.
+2. Point `GOOGLE_APPLICATION_CREDENTIALS` at it (or save as
+   `google-credentials.json` in the project root).
+3. Share your sheet with the service account email as Editor.
+4. `uv run saasnews-sync --incremental`
 
-### How incremental sync works
-- Reads existing Job URLs from the sheet
-- Appends only rows whose Job URL isn't already there
-- Deduplication is automatic
-
-## Daily cron job
-
-```bash
-crontab -e
-# Add:
-0 9 * * * cd /path/to/saasnews-job-finder && bash run_daily.sh >> /var/log/saasnews.log 2>&1
-```
-
-## Testing
-
-```bash
-python tests/run_tests.py
-```
-
-**188 tests** covering:
-- Role matching (Python-stack only)
-- Internship matching
-- Fresher filter (title + JD text verification)
-- Seniority detection (Sr., II, III, Roman numerals)
-- Years-of-experience extraction (10 regex patterns, 33 test cases)
-- Location matching (India + Remote-Worldwide)
-- Checkpoint + resume
-- Python-stack verification
-- Article parser (all 4 formats)
-- Playwright availability
-- Edge cases
-
-## Files
-
-```
-saasnews-job-finder/
-├── saasnews_scraper.py           # Main scraper (Playwright + requests hybrid)
-├── sync_to_google_sheets.py      # Google Sheets sync (full + incremental)
-├── combine_results.py            # Merge multiple runs
-├── run_daily.sh                  # Daily cron entrypoint
-├── tests/
-│   └── run_tests.py              # 188-test suite
-├── README.md
-├── requirements.txt              # Python dependencies (incl. playwright)
-└── download/
-    ├── saasnews_jobs_latest.xlsx
-    └── checkpoint.jsonl
-```
-
-## Troubleshooting
-
-**"No module named 'playwright'"** → `pip install playwright && playwright install chromium`
-
-**"Playwright init failed"** → Run `playwright install chromium` to install the browser.
-
-**"No matches found"** → The filter is strict. Try without `--fresher-only` first, or check if companies in your target pages have careers pages.
-
-**Script seems slow** → Playwright fallback adds ~5s per JS-rendered page. Reduce `--concurrency` to 4-5 if using Playwright. Use `--batch-size 500` for chunked processing.
-
-**Want to start fresh** → `python saasnews_scraper.py --reset-checkpoint --fresher-only`
+Incremental sync reads existing Job URLs from the sheet and appends only new
+rows — deduplication is automatic.
 
 ## Supported job boards
-- **Greenhouse** (US + EU, JSON API)
-- **Lever** (JSON API)
-- **Ashby** (JSON API)
-- **Workable** (JSON API)
-- **Any HTML careers page** (JSON-LD JobPosting + heuristic parsing)
-- **JS-rendered SPA careers pages** (Playwright fallback)
+
+Greenhouse (US + EU) · Lever · Ashby · Workable (JSON APIs when detected) ·
+any HTML careers page (JSON-LD `JobPosting` + heuristics) · JS-rendered SPA
+pages (Playwright fallback).
